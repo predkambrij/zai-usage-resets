@@ -1,0 +1,8 @@
+day,usage_tokens,billing_tokens,billing_rows,input_tokens,cached_input_tokens,output_tokens,other_tokens,list_price_cost,actual_billed_amount,billing_source,gap_tokens,included_in_comparison
+2026-10-09,74183262,74554711,6,7840621,65927296,786794,0,3.87579160,0,day,-371449,True
+2026-10-10,123091564,123663327,6,7445453,115275904,941970,0,5.05684759,0,day,-571763,True
+2026-10-11,0,,0,,,,,,,none,0,True
+2026-10-12,0,,0,,,,,,,none,0,True
+2026-10-13,0,,0,,,,,,,none,0,True
+2026-10-14,14,14,2,13,0,1,0,0.0000226,0,day,0,True
+2026-10-15,171469342,172284164,1000,5161502,166534994,587668,0,6.06410912,0,minutely,-814822,True

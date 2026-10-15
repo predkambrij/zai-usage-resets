@@ -1,0 +1,30 @@
+services:
+  daily:
+    build:
+      context: .
+      args:
+        DAILY_REQUIREMENTS: &daily_requirements |
+          matplotlib>=3.8
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        WORKDIR /app
+        ENV PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONUNBUFFERED=1 \
+            MPLCONFIGDIR=/tmp/matplotlib
+        ARG DAILY_REQUIREMENTS
+        RUN printf '%s' "$$DAILY_REQUIREMENTS" > requirements-daily.txt \
+            && python -m pip install --no-cache-dir -r requirements-daily.txt
+        ENTRYPOINT ["python", "/app/zai_daily.py"]
+    environment:
+      ZAI_API_KEY: ${ZAI_API_KEY:?Set ZAI_API_KEY in .env or your environment}
+      ZAI_API_BASE: ${ZAI_API_BASE:-https://api.z.ai}
+    configs:
+      - source: daily-requirements
+        target: /app/requirements-daily.txt
+    volumes:
+      - ./zai_daily.py:/app/zai_daily.py:ro
+      - ./reports:/app/reports
+
+configs:
+  daily-requirements:
+    content: *daily_requirements

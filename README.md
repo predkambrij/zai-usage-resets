@@ -42,6 +42,39 @@ file next to the script. `.env` is gitignored.
 Exit codes: `0` fine, `1` some limit is at 100%, `2` error — so it works in cron
 or a monitor.
 
+## Daily usage and billing
+
+`zai_daily.py` compares daily billing records with Z.ai's usage report. Run it
+with Docker Compose; Python and plotting dependencies stay in the container.
+Set `ZAI_API_KEY` in `.env` as above, then:
+
+```sh
+docker compose run --build --rm daily --start-date 2026-10-09 --end-date 2026-10-15
+```
+
+Omit dates for month-to-date. Dates are inclusive, use **UTC+8**, and can span
+up to 31 days. The full requested range is included. If the final day has no
+daily billing rows, minutely records are aggregated automatically and marked `†`.
+
+- **CLI:** daily totals and gaps, plus input/cached-input/output token counts
+  and list-price costs, overall and per model.
+- **Chart:** stacked billing categories, usage totals, signed gaps, and a daily
+  table with list-price costs.
+- **CSV:** exact daily counts, costs, and billing sources.
+
+Files are saved to `reports/zai-daily.png` and `reports/zai-daily.csv` on the host.
+Use `--output reports/custom.png` to change the name (`.svg` and `.pdf` also work),
+or `docker compose run --rm daily --help` for options.
+
+Gap means **usage − billing**; a negative value means billing reports more
+tokens. The APIs can lag or disagree. `no rows` means missing billing data,
+not confirmed zero usage or cost. List-price cost uses the ledger's model prices
+in the account currency; it is not the amount charged for your Coding Plan.
+
+![Daily billing and usage comparison](docs/zai-daily.png)
+
+[Example CSV](docs/zai-daily.csv)
+
 ## Caveat
 
 `/api/monitor/usage/quota/limit` is undocumented, so z.ai may change or remove it
