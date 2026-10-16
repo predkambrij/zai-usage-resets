@@ -18,6 +18,7 @@ services:
     environment:
       ZAI_API_KEY: ${ZAI_API_KEY:?Set ZAI_API_KEY in .env or your environment}
       ZAI_API_BASE: ${ZAI_API_BASE:-https://api.z.ai}
+      ZAI_CUSTOMER_ID: ${ZAI_CUSTOMER_ID:-}
     configs:
       - source: daily-requirements
         target: /app/requirements-daily.txt

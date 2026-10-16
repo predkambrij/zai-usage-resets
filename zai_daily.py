@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare daily Z.ai billing and usage; save a chart and an exact CSV report."""
+"""Report daily Z.ai API billing; save a chart and an exact CSV report."""
 
 import argparse
 import csv
@@ -59,6 +59,23 @@ def request(base, path, key, params=None):
     if not isinstance(body.get("data"), dict):
         raise BillingError("Unexpected API data structure")
     return body["data"]
+
+
+def fetch_available_balance(*, api_key=None):
+    """Read the current available balance independently of report dates."""
+    load_env()
+    key = api_key if api_key is not None else os.environ.get("ZAI_API_KEY")
+    if not key:
+        raise BillingError("Pass --api-key or set ZAI_API_KEY in the environment or .env")
+    data = request(os.environ.get("ZAI_API_BASE", "https://api.z.ai"),
+                   "/api/biz/account/query-customer-account-report", key)
+    try:
+        balance = Decimal(str(data.get("availableBalance")))
+        if not balance.is_finite():
+            raise InvalidOperation
+    except InvalidOperation as exc:
+        raise BillingError("Invalid or missing available account balance") from exc
+    return balance
 
 
 def collect_rows(base, key, customer_id, period, *, granularity="day", billing_day=None):
@@ -314,7 +331,7 @@ def build_overlay(report, rows):
 @dataclass(frozen=True)
 class DailyReport:
     day: date
-    usage_tokens: Decimal
+    usage_tokens: Decimal | None
     billing_tokens: Decimal
     billing_rows: int
     input_tokens: Decimal
@@ -328,47 +345,68 @@ class DailyReport:
     @property
     def gap_tokens(self):
         """Positive means usage is higher; negative means billing is higher."""
-        return self.usage_tokens - self.billing_tokens
+        return None if self.usage_tokens is None else self.usage_tokens - self.billing_tokens
 
 
-def fetch_daily_reports(start, end):
+def fetch_daily_reports(start, end, *, api_key=None, customer_id=None, compare_usage=False):
     """Return daily summaries and ledger rows for category/model cost breakdowns."""
     load_env()
-    key = os.environ.get("ZAI_API_KEY")
+    key = api_key if api_key is not None else os.environ.get("ZAI_API_KEY")
     if not key:
-        raise BillingError("Set ZAI_API_KEY in the environment or .env")
+        raise BillingError("Pass --api-key or set ZAI_API_KEY in the environment or .env")
     base = os.environ.get("ZAI_API_BASE", "https://api.z.ai")
 
-    usage = fetch_usage_report(base, key, start, end)
-    customer_id = os.environ.get("ZAI_CUSTOMER_ID")
+    usage = fetch_usage_report(base, key, start, end) if compare_usage else None
     if customer_id is None:
-        customer = request(base, "/api/biz/customer-package-reset/list", key,
-                               {"targetType": "PERSONAL"})
-        customer_id = str(customer.get("customerId", ""))
+        customer_id = os.environ.get("ZAI_CUSTOMER_ID") or None
+    if customer_id is None:
+        customer = request(base, "/api/biz/customerService/zaiUserInfo", key)
+        customer_id = str(customer.get("customerNumber", ""))
     if not re.fullmatch(r"[0-9]+", customer_id):
-        raise BillingError("Cannot discover customer ID; set ZAI_CUSTOMER_ID")
+        raise BillingError("Cannot discover customer ID; pass --customer-id or set ZAI_CUSTOMER_ID")
 
     rows, _ = collect_interval_rows(base, key, customer_id, start, end)
-    rows = fill_last_day_from_minutely(base, key, customer_id, rows, end)
+    rows = fill_missing_days_from_minutely(base, key, customer_id, rows, start, end)
     sources = {row["billingDate"]: row.get("_billingSource", "day") for row in rows}
-    overlay = build_overlay(usage, rows)
+    if usage is not None:
+        overlay = build_overlay(usage, rows)
+    else:
+        by_day = defaultdict(list)
+        for row in rows:
+            by_day[row["billingDate"]].append(row)
+        days = {}
+        current = date.fromisoformat(start)
+        while current.isoformat() <= end:
+            day = current.isoformat()
+            selected = by_day[day]
+            totals, _ = summarize(selected)
+            days[day] = {"usageTokens": None, "billing": totals, "billingRows": len(selected)}
+            current += timedelta(days=1)
+        overlay = {"byDay": days}
     return daily_reports_from_overlay(overlay, sources), rows
 
 
-def fill_last_day_from_minutely(base, key, customer_id, daily_rows, last_day):
-    """Use minute records only when the final day has no daily ledger rows."""
-    if any(row["billingDate"] == last_day for row in daily_rows):
-        return daily_rows
-
-    minute_rows = collect_rows(base, key, customer_id, last_day[:7], granularity="minutely", billing_day=last_day)
+def fill_missing_days_from_minutely(base, key, customer_id, daily_rows, start, end):
+    """Fill days without daily rows, without duplicating recorded daily data."""
+    recorded = {row["billingDate"] for row in daily_rows}
+    current = date.fromisoformat(start)
+    missing = set()
+    while current.isoformat() <= end:
+        if current.isoformat() not in recorded:
+            missing.add(current.isoformat())
+        current += timedelta(days=1)
     fallback = []
-    for row in minute_rows:
-        try:
-            day = datetime.fromisoformat(row["billingDate"]).date().isoformat()
-        except (KeyError, TypeError, ValueError) as exc:
-            raise BillingError("Invalid minutely billingDate; cannot align final day") from exc
-        if day == last_day:
-            fallback.append({**row, "billingDate": day, "_billingSource": "minutely"})
+    for period in sorted({day[:7] for day in missing}):
+        for row in collect_rows(base, key, customer_id, period, granularity="minutely"):
+            try:
+                timestamp = datetime.fromisoformat(row["billingDate"])
+                if timestamp.tzinfo is not None:
+                    raise ValueError
+                day = timestamp.date().isoformat()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise BillingError("Invalid minutely billingDate; expected local UTC+8 time") from exc
+            if day in missing:
+                fallback.append({**row, "billingDate": day, "_billingSource": "minutely"})
     return daily_rows + fallback
 
 
@@ -394,9 +432,16 @@ def daily_reports_from_overlay(overlay, sources=None):
 
 
 def total_tokens(reports):
-    usage = sum((report.usage_tokens for report in reports), Decimal(0))
+    usage = (sum((report.usage_tokens for report in reports), Decimal(0))
+             if all(report.usage_tokens is not None for report in reports) else None)
     billing = sum((report.billing_tokens for report in reports), Decimal(0))
-    return usage, billing, usage - billing
+    return usage, billing, None if usage is None else usage - billing
+
+
+def token_cell(value, signed=False):
+    if value is None:
+        return "n/a"
+    return f"{value:+,f}" if signed else f"{value:,f}"
 
 
 def print_daily_table(reports):
@@ -406,19 +451,23 @@ def print_daily_table(reports):
         billing = f"{report.billing_tokens:,.0f}" if report.billing_rows else "no rows"
         cost = f"{report.list_price_cost:.6f}" if report.billing_rows else "no rows"
         billed = f"{report.actual_billed_amount:.6f}" if report.billing_rows else "no rows"
-        print(f"{report.day.isoformat():<12} {billing:>15} {report.usage_tokens:>15,.0f} "
-              f"{report.gap_tokens:>+15,.0f} {cost:>12} {billed:>12}")
+        print(f"{report.day.isoformat():<12} {billing:>15} {token_cell(report.usage_tokens):>15} "
+              f"{token_cell(report.gap_tokens, True):>15} {cost:>12} {billed:>12}")
 
     usage, billing, gap = total_tokens(reports)
-    print(f"{'TOTAL':<12} {billing:>15,.0f} {usage:>15,.0f} {gap:>+15,.0f}")
+    print(f"{'TOTAL':<12} {billing:>15,.0f} {token_cell(usage):>15} {token_cell(gap, True):>15}")
+    if usage is None:
+        print("Usage comparison unavailable: enable --compare-usage only with a Coding Plan.")
     if usage:
         print(f"Gap as a percentage of usage: {gap / usage * 100:+.4f}%")
-    else:
+    elif usage is not None:
         print("Gap percentage: unavailable (zero usage in comparison)")
     for report in reports:
         if report.billing_source == "minutely":
             print(f"{report.day}: billing tokens and costs aggregated from minutely records (no daily rows).")
-    print("No billing rows means no recorded ledger data; the token gap uses a ledger sum of zero.")
+    print("No billing rows means no recorded ledger data.")
+    if usage is not None:
+        print("The token gap uses a ledger sum of zero for days without rows.")
     print("Costs use the account currency.")
 
 
@@ -497,7 +546,7 @@ def save_csv(reports, path):
                     if field not in ("day", "usage_tokens", "billing_rows", "billing_source"):
                         values[field] = ""
             values["gap_tokens"] = report.gap_tokens
-            values["included_in_comparison"] = True
+            values["included_in_comparison"] = report.usage_tokens is not None
             writer.writerow(values)
 
 
@@ -529,10 +578,11 @@ def chart_table_rows(reports):
         day = report.day.isoformat() + (" *" if not report.billing_rows else "")
         if report.billing_source == "minutely":
             day += " †"
-        counts = [f"{getattr(report, field):,f}" for field in fields]
+        counts = [token_cell(getattr(report, field)) for field in fields]
         rows.append([day] + counts + chart_cost_cells([report]))
-    totals = [sum((getattr(report, field) for report in reports), Decimal(0)) for field in fields]
-    rows.append(["TOTAL"] + [f"{value:,f}" for value in totals] + chart_cost_cells(reports))
+    totals = [None if any(getattr(report, field) is None for report in reports) else
+              sum((getattr(report, field) for report in reports), Decimal(0)) for field in fields]
+    rows.append(["TOTAL"] + [token_cell(value) for value in totals] + chart_cost_cells(reports))
     return rows
 
 
@@ -545,10 +595,11 @@ def draw_token_breakdown(axis, reports):
         axis.bar(days, values, bottom=bottom, width=0.6, label=label, color=color)
         bottom = [previous + value for previous, value in zip(bottom, values)]
 
-    usage = [float(report.usage_tokens) for report in reports]
+    usage = [float(report.usage_tokens) if report.usage_tokens is not None else float("nan") for report in reports]
     axis.plot(days, bottom, "o:", label="Billing total (top of stack)",
               color="#334155", linewidth=1, markersize=4)
-    axis.plot(days, usage, "D--", label="Usage API total", color="#ea580c", linewidth=2)
+    if any(report.usage_tokens is not None for report in reports):
+        axis.plot(days, usage, "D--", label="Usage API total", color="#ea580c", linewidth=2)
     missing = [index for index, report in enumerate(reports) if not report.billing_rows]
     if missing:
         axis.scatter(missing, [0] * len(missing), marker="x", color="#64748b",
@@ -561,6 +612,11 @@ def draw_token_breakdown(axis, reports):
 
 def draw_gap(axis, reports):
     """Show the signed residual separately so small discrepancies are visible."""
+    if any(report.gap_tokens is None for report in reports):
+        axis.axis("off")
+        axis.text(0.5, 0.5, "Usage comparison unavailable · billing report only",
+                  ha="center", va="center", transform=axis.transAxes)
+        return
     days = list(range(len(reports)))
     gaps = [float(report.gap_tokens) for report in reports]
     colors = ["#ea580c" if gap >= 0 else "#475569" for gap in gaps]
@@ -614,7 +670,12 @@ def save_chart(reports, path):
     draw_token_breakdown(counts_axis, reports)
     draw_gap(gap_axis, reports)
     draw_detail_table(table_axis, reports)
-    counts_axis.tick_params(axis="x", labelbottom=False)
+    if all(report.usage_tokens is not None for report in reports):
+        counts_axis.tick_params(axis="x", labelbottom=False)
+    else:
+        counts_axis.set_xticks(range(len(reports)), [report.day.isoformat() for report in reports],
+                              rotation=45, ha="right")
+        counts_axis.set_xlabel("Billing day (UTC+8)")
     for axis in (counts_axis, gap_axis):
         axis.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value / 1_000_000:g} M"))
         axis.grid(axis="y", alpha=0.2)
@@ -622,15 +683,15 @@ def save_chart(reports, path):
 
     period = f"{reports[0].day} through {reports[-1].day}" if reports else "No comparison days remain"
     usage_total, billing_total, gap_total = total_tokens(reports)
-    figure.suptitle(
+    title = (f"Z.ai daily API billing · {period}\n{billing_total:,f} billed tokens"
+             if usage_total is None else
         f"Z.ai daily token reconciliation · {period}\n"
         f"Input + cached input + output + other = billing; billing + gap = usage\n"
-        f"{billing_total:,f} billing {gap_total:+,f} gap = {usage_total:,f} usage tokens",
-        fontsize=12,
-    )
+        f"{billing_total:,f} billing {gap_total:+,f} gap = {usage_total:,f} usage tokens")
+    figure.suptitle(title, fontsize=12)
     footer = "* No billing rows: category sums are zero, not confirmed zero consumption. Gap is an unexplained difference."
     if any(report.billing_source == "minutely" for report in reports):
-        footer += "\n† Minutely records aggregated for the final day because daily billing rows are absent."
+        footer += "\n† Minutely records aggregated for days with no daily billing rows."
     figure.supxlabel(footer, fontsize=9)
     figure.savefig(path, dpi=160)
     plt.close(figure)
@@ -639,7 +700,10 @@ def save_chart(reports, path):
 def main():
     today = datetime.now(timezone(timedelta(hours=8))).date()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start-date", default=today.replace(day=1).isoformat(), help="first UTC+8 day (default: month start)")
+    parser.add_argument("--api-key", help="Z.ai API key (default: ZAI_API_KEY from environment or .env)")
+    parser.add_argument("--customer-id", help="billing customer ID (default: discover from API account)")
+    parser.add_argument("--compare-usage", action="store_true", help="compare against the usage monitor (requires a Coding Plan)")
+    parser.add_argument("--start-date", default=(today - timedelta(days=6)).isoformat(), help="first UTC+8 day (default: six days ago, for seven days including today)")
     parser.add_argument("--end-date", default=today.isoformat(), help="last UTC+8 day (default: today)")
     parser.add_argument("--output", type=Path, default=Path("reports/zai-daily.png"), help="chart path (.png, .svg, or .pdf); CSV saved beside it")
     args = parser.parse_args()
@@ -649,9 +713,15 @@ def main():
     try:
         import matplotlib  # Check the optional dependency before making API calls.
     except ImportError as exc:
-        raise BillingError("Install chart dependencies: python3 -m pip install -r requirements-daily.txt") from exc
+        raise BillingError("Install chart dependencies: python3 -m pip install 'matplotlib>=3.8'") from exc
 
-    reports, billing_rows = fetch_daily_reports(start, end)
+    reports, billing_rows = fetch_daily_reports(start, end, api_key=args.api_key,
+                                              customer_id=args.customer_id, compare_usage=args.compare_usage)
+    try:
+        balance = fetch_available_balance(api_key=args.api_key)
+        print(f"Available account balance: ${balance:,.9f} USD (current, independent of report dates)\n")
+    except BillingError as exc:
+        print(f"Available account balance: unavailable ({exc})\n")
     print_daily_table(reports)
     print_cost_breakdown(billing_rows, reports)
     args.output.parent.mkdir(parents=True, exist_ok=True)

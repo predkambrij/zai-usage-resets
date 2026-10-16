@@ -50,6 +50,8 @@ Set `ZAI_API_KEY` in `.env` as above, then:
 
 ```sh
 docker compose run --build --rm daily --start-date 2026-10-09 --end-date 2026-10-15
+# or
+docker compose run --build --rm daily
 ```
 
 Omit dates for month-to-date. Dates are inclusive, use **UTC+8**, and can span
